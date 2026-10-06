@@ -123,6 +123,60 @@ async def test_decorator_validation():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("multiple_model_ids", [False, True])
+async def test_batch_separates_method_instances(streaming, multiple_model_ids):
+    class Base:
+        def __init__(self, name):
+            self.name = name
+            self.batches = []
+
+        # Instance identity, not equality or hashability, determines which
+        # requests can be passed to the same bound method.
+        def __eq__(self, other):
+            return isinstance(other, Base)
+
+        @serve.batch(max_batch_size=6, batch_wait_timeout_s=1000)
+        async def unary(self, requests):
+            self.batches.append(requests)
+            return [(self.name, request) for request in requests]
+
+        @serve.batch(max_batch_size=6, batch_wait_timeout_s=1000)
+        async def streaming(self, requests):
+            self.batches.append(requests)
+            yield [(self.name, request) for request in requests]
+
+    class First(Base):
+        pass
+
+    class Second(Base):
+        pass
+
+    # Cover both instances of the same subclass and different subclasses
+    # inheriting one decorated method.
+    instances = [First("first"), First("second"), Second("third")]
+
+    async def call(instance, value):
+        if multiple_model_ids:
+            serve.context._set_request_context(multiplexed_model_id=str(value))
+        if streaming:
+            return [result async for result in instance.streaming(value)]
+        return [await instance.unary(value)]
+
+    results = await asyncio.wait_for(
+        asyncio.gather(
+            *(call(instance, value) for value in range(2) for instance in instances)
+        ),
+        timeout=10,
+    )
+    assert results == [
+        [(instance.name, value)] for value in range(2) for instance in instances
+    ]
+    for instance in instances:
+        assert instance.batches == ([[0], [1]] if multiple_model_ids else [[0, 1]])
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("use_class", [True, False])
 async def test_batch_size_one_long_timeout(use_class):
     @serve.batch(max_batch_size=1, batch_wait_timeout_s=1000)

@@ -440,36 +440,34 @@ class _BatchQueue:
             for future in futures:
                 _set_exception_if_not_done(future, e)
 
-    def _split_batch_by_model_id(
+    def _split_batch_by_instance_and_model(
         self, batch: List[_SingleRequest]
     ) -> List[List[_SingleRequest]]:
-        """Split a batch into sub-batches based on multiplexed_model_id.
+        """Split a batch by receiver identity and multiplexed model ID.
 
-        When using model multiplexing with batching, requests for different models
-        may end up in the same batch. This method ensures that each sub-batch only
-        contains requests for the same model, preventing issues where a single batch
-        contains requests for different models.
-
-        If no requests have a multiplexed_model_id set, returns the original batch
-        as a single sub-batch.
+        The batch handler uses the first request's ``self_arg`` for the entire
+        sub-batch, so all requests must target the same instance. Use identity
+        rather than equality to support unhashable instances and instances that
+        compare equal but have different state.
 
         Args:
             batch: The batch of requests to split.
 
         Returns:
             A list of sub-batches, where each sub-batch contains requests for the
-            same multiplexed_model_id.
+            same instance and multiplexed_model_id.
         """
-        # Group requests by their multiplexed_model_id
-        model_id_to_requests: Dict[str, List[_SingleRequest]] = {}
+        key_to_requests: Dict[Tuple[int, str], List[_SingleRequest]] = {}
         for request in batch:
-            model_id = request.request_context.multiplexed_model_id
-            if model_id not in model_id_to_requests:
-                model_id_to_requests[model_id] = []
-            model_id_to_requests[model_id].append(request)
+            key = (
+                id(request.self_arg),
+                request.request_context.multiplexed_model_id,
+            )
+            if key not in key_to_requests:
+                key_to_requests[key] = []
+            key_to_requests[key].append(request)
 
-        # Return sub-batches for each model_id
-        return list(model_id_to_requests.values())
+        return list(key_to_requests.values())
 
     async def _process_batches(self, func: Callable) -> None:
         """Loops infinitely and processes queued request batches."""
@@ -479,11 +477,9 @@ class _BatchQueue:
         while not self._loop.is_closed():
             batch, _ = await self.wait_for_batch()
 
-            # Split batch by multiplexed_model_id to ensure requests for different
-            # models are processed in separate batches. This is necessary when using
-            # model multiplexing with batching, as a single batch containing requests
-            # for different models would not work correctly.
-            sub_batches = self._split_batch_by_model_id(batch)
+            # Requests must share both the receiver instance and model ID to
+            # be processed by the same invocation of the batch handler.
+            sub_batches = self._split_batch_by_instance_and_model(batch)
 
             # Process all sub-batches together under a single semaphore permit.
             # This ensures sub-batches from the same original batch run concurrently
@@ -848,6 +844,9 @@ def batch(
     The function can be a standalone function or a class method. In both
     cases, the function must be `async def` and take a list of objects as
     its sole argument and return a list of the same length as a result.
+
+    Requests to different instances are processed in separate calls to the batch
+    handler, even when the instances share the same decorated method.
 
     When invoked, the caller passes a single object. These will be batched
     and executed asynchronously once there is a batch of `max_batch_size`
